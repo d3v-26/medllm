@@ -1,0 +1,433 @@
+#!/usr/bin/env python3
+"""medllm - serve and talk to medical vision-language models on this machine.
+
+  medllm login                 verify your Hugging Face account (needed once)
+  medllm models                list models, your access, and what is running
+  medllm serve <model>         start a model on free GPUs (needs docker access)
+  medllm chat [model]          interactive chat (supports /image)
+  medllm ask "question" [-i img]   one-shot question (stdin also works)
+  medllm env [model]           print OPENAI_BASE_URL / OPENAI_API_KEY exports
+  medllm status | stop <model|--all> | logs <model>
+
+Research use only - not for clinical decisions. Do not send identifiable PHI
+unless your approvals cover it.  See README.md
+"""
+import argparse, base64, fcntl, getpass, json, mimetypes, os, re, secrets, subprocess, sys, time
+import urllib.error, urllib.request
+
+ROOT = os.environ.get("MEDLLM_ROOT", "/mnt/data/llm")  # shared dir: hf-cache/, run/
+CACHE = f"{ROOT}/hf-cache"
+RUN = f"{ROOT}/run"
+IMAGE = "vllm/vllm-openai:latest"
+CONF = os.path.expanduser("~/.config/medllm/config.json")
+GROUPS = [[0, 1, 2, 3], [4, 5, 6, 7]]
+FREE_MIB = 2048  # a GPU using less than this counts as free
+
+# alias -> (HF repo, GPUs needed, port, gated)
+MODELS = {
+    "medgemma-4b":  ("google/medgemma-4b-it", 1, 8101, True),
+    "lingshu-7b":   ("lingshu-medical-mllm/Lingshu-7B", 1, 8102, False),
+    "medgemma-27b": ("google/medgemma-27b-it", 4, 8127, True),
+    "qwen3-vl-32b": ("Qwen/Qwen3-VL-32B-Instruct", 4, 8132, False),
+}
+SYSTEM = ("You are a medical AI assistant for research and education. Be accurate and concise, "
+          "state uncertainty, and remind the user that outputs are not clinical advice.")
+
+
+def die(msg, code=1):
+    print(f"medllm: {msg}", file=sys.stderr); sys.exit(code)
+
+
+# ---------- config / HF ----------
+def load_conf():
+    try:
+        return json.load(open(CONF))
+    except Exception:
+        return {}
+
+
+def save_conf(c):
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    fd = os.open(CONF, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(c, f)
+
+
+def hf_get(url, token, method="GET"):
+    req = urllib.request.Request(url, method=method, headers={"Authorization": f"Bearer {token}"})
+    try:
+        return urllib.request.urlopen(req, timeout=20)
+    except urllib.error.HTTPError as e:
+        return e
+
+
+def hf_access(token, repo):
+    r = hf_get(f"https://huggingface.co/{repo}/resolve/main/config.json", token, "HEAD")
+    return getattr(r, "status", None) == 200 or getattr(r, "code", None) == 200
+
+
+def need_login(alias=None):
+    c = load_conf()
+    if not c.get("user"):
+        die("not logged in. Run: medllm login")
+    if alias and MODELS[alias][3] and not c.get("access", {}).get(alias):
+        die(f"your HF account ({c['user']}) has no verified access to {MODELS[alias][0]}. "
+            f"Accept its license on huggingface.co, then run: medllm login")
+    return c
+
+
+def cmd_login(a):
+    token = os.environ.get("HF_TOKEN")
+    if not token and a.from_hf_cli:
+        p = os.path.expanduser("~/.cache/huggingface/token")
+        token = open(p).read().strip() if os.path.exists(p) else None
+    if not token:
+        print("Create a read token at https://huggingface.co/settings/tokens")
+        token = getpass.getpass("HF token (input hidden): ").strip()
+    r = hf_get("https://huggingface.co/api/whoami-v2", token)
+    if getattr(r, "status", getattr(r, "code", 0)) != 200:
+        die("Hugging Face rejected that token.")
+    user = json.load(r)["name"]
+    access = {k: hf_access(token, v[0]) for k, v in MODELS.items()}
+    save_conf({"user": user, "access": access, "checked": int(time.time())})  # token itself is NOT stored
+    print(f"Logged in as {user} (token not stored).")
+    for k, ok in access.items():
+        print(f"  {k:14s} {'OK' if ok else 'NO ACCESS - accept license at https://huggingface.co/' + MODELS[k][0]}")
+
+
+# ---------- state ----------
+def state_path(alias): return f"{RUN}/{alias}.json"
+
+
+def read_state(alias):
+    try:
+        return json.load(open(state_path(alias)))
+    except Exception:
+        return None
+
+
+def write_state(s):
+    tmp = state_path(s["alias"]) + f".{os.getpid()}"
+    with open(tmp, "w") as f: json.dump(s, f)
+    os.chmod(tmp, 0o664); os.replace(tmp, state_path(s["alias"]))
+
+
+def http_ok(port, path="/health", timeout=2):
+    try:
+        return urllib.request.urlopen(f"http://127.0.0.1:{port}{path}", timeout=timeout).status == 200
+    except Exception:
+        return False
+
+
+def docker(*args, check=False):
+    try:
+        return subprocess.run(["docker", *args], capture_output=True, text=True, check=check)
+    except FileNotFoundError:
+        die("docker not found")
+    except subprocess.CalledProcessError as e:
+        die(f"docker failed: {e.stderr.strip()[-400:]}")
+
+
+def container_running(name):
+    r = docker("inspect", "-f", "{{.State.Running}}", name)
+    return r.returncode == 0 and r.stdout.strip() == "true"
+
+
+def have_docker():
+    return docker("info").returncode == 0
+
+
+def instance_status(alias):
+    """-> (state_dict|None, 'up'|'starting'|'down')"""
+    s = read_state(alias)
+    if not s: return None, "down"
+    if http_ok(s["port"]): return s, "up"
+    if time.time() - s["started"] < 1200: return s, "starting"
+    return s, "down"
+
+
+def gpu_used():
+    out = subprocess.check_output(["nvidia-smi", "--query-gpu=index,memory.used",
+                                   "--format=csv,noheader,nounits"], text=True)
+    return {int(l.split(",")[0]): int(l.split(",")[1]) for l in out.strip().splitlines()}
+
+
+def reserved_gpus():
+    r = set()
+    for alias in MODELS:
+        s, st = instance_status(alias)
+        if s and st != "down": r |= set(s["gpus"])
+    return r
+
+
+def pick_gpus(n):
+    used, res = gpu_used(), reserved_gpus()
+    free = {g for g, m in used.items() if m < FREE_MIB and g not in res}
+    if n == 4:
+        for grp in GROUPS:
+            if set(grp) <= free: return grp
+        return None
+    cands = sorted(free, key=lambda g: (sum(1 for x in GROUPS[g // 4] if x in free), g))
+    return [cands[0]] if cands else None  # fill the group that is already busiest first
+
+
+# ---------- serve / stop ----------
+def cmd_serve(a):
+    alias = a.model; repo, ngpu, port, _ = MODELS[alias]
+    c = need_login(alias)
+    s, st = instance_status(alias)
+    if st != "down":
+        print(f"{alias} is already {st} on port {s['port']} (GPUs {s['gpus']}, started by {s['owner']})."); return
+    if not have_docker():
+        die("you do not have docker access, so you can't start models. Ask a docker-group member to run "
+            f"'medllm serve {alias}', or use a model that is already running (medllm status).")
+    os.makedirs(RUN, exist_ok=True)
+    with open(f"{RUN}/alloc.lock", "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        gpus = pick_gpus(ngpu)
+        if not gpus:
+            die(f"no free {ngpu}-GPU slot right now. See: medllm status")
+        key = secrets.token_urlsafe(24); name = f"medllm-{alias}"
+        docker("rm", "-f", name)
+        cmd = ["run", "-d", "--name", name, "--label", "medllm=1", "--gpus", '"device=' + ",".join(map(str, gpus)) + '"',
+               "--ipc=host", "-p", f"127.0.0.1:{port}:8000", "-v", f"{CACHE}:/root/.cache/huggingface",
+               "-e", "HF_HUB_OFFLINE=1", "-e", "VLLM_API_KEY",
+               IMAGE, "--model", repo, "--served-model-name", alias, "--tensor-parallel-size", str(ngpu),
+               "--max-model-len", str(a.ctx), "--gpu-memory-utilization", "0.90",
+               "--limit-mm-per-prompt", json.dumps({"image": 8})]
+        # the key travels via the VLLM_API_KEY env var (read by vLLM), so it never appears in `ps`
+        env = dict(os.environ, VLLM_API_KEY=key)
+        r = subprocess.run(["docker", *cmd], capture_output=True, text=True, env=env)
+        if r.returncode != 0: die(f"docker run failed: {r.stderr.strip()[-400:]}")
+        kp = f"{RUN}/{alias}.key"
+        with open(kp, "w") as f: f.write(key)
+        os.chmod(kp, 0o640)
+        write_state(dict(alias=alias, model=repo, port=port, gpus=gpus, owner=c["user"], container=name,
+                         started=time.time(), idle_min=a.idle, last_active=time.time()))
+    if a.idle > 0:
+        log = open(f"{RUN}/{alias}.watch.log", "a")
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "_watch", alias], start_new_session=True,
+                         stdout=log, stderr=log, stdin=subprocess.DEVNULL)
+    print(f"Starting {alias} on GPUs {gpus} (port {port}); idle shutdown: {'never' if a.idle == 0 else str(a.idle) + ' min'}")
+    if a.no_wait: return
+    t0 = time.time()
+    while not http_ok(port):
+        if not container_running(name):
+            die("container exited during startup. See: medllm logs " + alias)
+        if time.time() - t0 > 1500: die("timed out waiting for the model")
+        print(".", end="", flush=True); time.sleep(5)
+    print(f"\nReady in {int(time.time() - t0)}s.  Try: medllm chat {alias}")
+
+
+def cmd_watch(a):
+    """background idle reaper: stops the container after idle_min minutes with no requests."""
+    alias = a.model
+    last, prev = time.time(), None
+    while True:
+        time.sleep(30)
+        s = read_state(alias)
+        if not s or not container_running(s["container"]):
+            if s: os.remove(state_path(alias))
+            return
+        if not http_ok(s["port"]): continue
+        try:
+            m = urllib.request.urlopen(f"http://127.0.0.1:{s['port']}/metrics", timeout=5).read().decode()
+        except Exception:
+            continue
+        act = sum(float(x) for x in re.findall(r'^vllm:request_success_total\{.*\} ([\d.e+]+)$', m, re.M)) \
+            + sum(float(x) for x in re.findall(r'^vllm:num_requests_(?:running|waiting)\{.*\} ([\d.e+]+)$', m, re.M))
+        if prev is None or act != prev:
+            last, prev = time.time(), act
+            s["last_active"] = last; write_state(s)
+        if time.time() - last > s["idle_min"] * 60:
+            print(time.ctime(), "idle timeout, stopping", alias, flush=True)
+            docker("rm", "-f", s["container"])
+            for p in (state_path(alias), f"{RUN}/{alias}.key"):
+                try: os.remove(p)
+                except OSError: pass
+            return
+
+
+def cmd_stop(a):
+    targets = list(MODELS) if a.all else ([a.model] if a.model else [])
+    if not targets: die("name a model or use --all")
+    me = load_conf().get("user")
+    for alias in targets:
+        s = read_state(alias)
+        if not s:
+            if not a.all: print(f"{alias}: not running")
+            continue
+        if s["owner"] != me and not a.force:
+            print(f"{alias}: started by {s['owner']}; use --force to stop it anyway"); continue
+        if not have_docker(): die("you do not have docker access")
+        docker("rm", "-f", s["container"])
+        for p in (state_path(alias), f"{RUN}/{alias}.key"):
+            try: os.remove(p)
+            except OSError: pass
+        print(f"stopped {alias}")
+
+
+def cmd_logs(a):
+    s = read_state(a.model)
+    if not s: die("not running")
+    r = docker("logs", "--tail", str(a.n), s["container"]); print(r.stdout + r.stderr)
+
+
+# ---------- info ----------
+def cmd_models(a):
+    c = load_conf()
+    print(f"{'MODEL':14s} {'HF REPO':36s} GPUS  YOUR ACCESS   STATE")
+    for k, (repo, n, port, gated) in MODELS.items():
+        s, st = instance_status(k)
+        acc = "-" if not c else ("yes" if (not gated or c.get("access", {}).get(k)) else "NO (license)")
+        print(f"{k:14s} {repo:36s} {n:<5d} {acc:12s} {st if s else 'stopped'}")
+
+
+def cmd_status(a):
+    used = gpu_used(); res = {}
+    for k in MODELS:
+        s, st = instance_status(k)
+        if s and st != "down":
+            for g in s["gpus"]: res[g] = k
+    print("GPUs: " + "  ".join(f"{g}:{res.get(g) or ('free' if used[g] < FREE_MIB else 'busy(other)')}" for g in sorted(used)))
+    any_ = False
+    for k in MODELS:
+        s, st = instance_status(k)
+        if not s: continue
+        any_ = True
+        idle = "never stops" if s["idle_min"] == 0 else f"auto-stop after {int(s['idle_min'] - (time.time() - s['last_active']) / 60)} more idle min"
+        print(f"  {k:14s} {st:9s} port {s['port']}  GPUs {s['gpus']}  owner {s['owner']}  {idle}")
+    if not any_: print("  no models running. Start one: medllm serve medgemma-27b")
+
+
+# ---------- talking to a server ----------
+def resolve(alias):
+    if alias:
+        if alias not in MODELS: die(f"unknown model '{alias}'. Options: {', '.join(MODELS)}")
+        s, st = instance_status(alias)
+        if st != "up": die(f"{alias} is {st if s else 'not running'}. Start it: medllm serve {alias}")
+        return alias, s
+    up = [(k, instance_status(k)[0]) for k in MODELS if instance_status(k)[1] == "up"]
+    if not up: die("no model is running. Start one: medllm serve medgemma-27b")
+    if len(up) > 1: die("several models running, pick one: " + ", ".join(k for k, _ in up))
+    return up[0]
+
+
+def api_key(alias):
+    try:
+        return open(f"{RUN}/{alias}.key").read().strip()
+    except OSError:
+        die("cannot read the server key (are you in the same group as the server owner?)")
+
+
+def log_usage(user, alias, kind):
+    try:
+        with open(f"{RUN}/usage.log", "a") as f:
+            f.write(json.dumps(dict(t=int(time.time()), user=user, model=alias, kind=kind)) + "\n")
+    except OSError:
+        pass
+
+
+def image_part(path):
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path): raise FileNotFoundError(path)
+    mt = mimetypes.guess_type(path)[0] or "image/png"
+    return {"type": "image_url", "image_url": {"url": f"data:{mt};base64," + base64.b64encode(open(path, "rb").read()).decode()}}
+
+
+def stream_chat(s, alias, messages, max_tokens, temperature, out=sys.stdout):
+    body = dict(model=alias, messages=messages, max_tokens=max_tokens, temperature=temperature, stream=True)
+    req = urllib.request.Request(f"http://127.0.0.1:{s['port']}/v1/chat/completions", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key(alias)}"})
+    text = ""
+    try:
+        with urllib.request.urlopen(req, timeout=600) as r:
+            for line in r:
+                line = line.decode().strip()
+                if not line.startswith("data:") or line.endswith("[DONE]"): continue
+                for ch in json.loads(line[5:]).get("choices", []):
+                    d = ch.get("delta", {}).get("content")
+                    if d: text += d; out.write(d); out.flush()
+    except urllib.error.HTTPError as e:
+        die(f"server error {e.code}: {e.read().decode()[:300]}")
+    out.write("\n"); return text
+
+
+def user_msg(text, imgs):
+    if not imgs: return {"role": "user", "content": text}
+    return {"role": "user", "content": [*[image_part(i) for i in imgs], {"type": "text", "text": text}]}
+
+
+def cmd_ask(a):
+    c = need_login(a.model if a.model in MODELS else None)
+    alias, s = resolve(a.model)
+    words = list(a.prompt or [])
+    use_stdin = "-" in words or (not words and not sys.stdin.isatty())  # stdin only when asked, to avoid hanging
+    text = " ".join(w for w in words if w != "-")
+    if use_stdin: text = (text + "\n\n" + sys.stdin.read()).strip()
+    if not text: die("give a question as an argument or on stdin")
+    log_usage(c["user"], alias, "ask")
+    msgs = [{"role": "system", "content": a.system or SYSTEM}, user_msg(text, a.image or [])]
+    stream_chat(s, alias, msgs, a.max_tokens, a.temperature)
+
+
+def cmd_chat(a):
+    c = need_login(a.model if a.model in MODELS else None)
+    alias, s = resolve(a.model)
+    log_usage(c["user"], alias, "chat")
+    print(f"medllm chat - {alias}.  /image <path> attach, /system <text>, /clear, /exit.  Research use only, not clinical advice.")
+    hist = [{"role": "system", "content": SYSTEM}]; pending = []
+    try:
+        import readline  # noqa: F401
+    except ImportError:
+        pass
+    while True:
+        try:
+            line = input(f"[{len(pending)} img] > " if pending else "> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print(); return
+        if not line: continue
+        if line in ("/exit", "/quit"): return
+        if line == "/clear": hist, pending = hist[:1], []; print("(cleared)"); continue
+        if line.startswith("/system "): hist[0]["content"] = line[8:]; print("(system prompt set)"); continue
+        if line.startswith("/image "):
+            p = line[7:].strip().strip("'\"")
+            if os.path.isfile(os.path.expanduser(p)): pending.append(p); print(f"(attached {p}; now type your question)")
+            else: print(f"no such file: {p}")
+            continue
+        msg = user_msg(line, pending); pending = []
+        try:
+            reply = stream_chat(s, alias, hist + [msg], a.max_tokens, a.temperature)
+        except SystemExit:
+            continue
+        hist += [msg, {"role": "assistant", "content": reply}]
+
+
+def cmd_env(a):
+    alias, s = resolve(a.model)
+    print(f"export OPENAI_BASE_URL=http://127.0.0.1:{s['port']}/v1\nexport OPENAI_API_KEY={api_key(alias)}\n# model name to use: {alias}")
+
+
+def main():
+    p = argparse.ArgumentParser(prog="medllm", description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sp = p.add_subparsers(dest="cmd", required=True)
+    x = sp.add_parser("login"); x.add_argument("--from-hf-cli", action="store_true", help="reuse the token from `hf auth login`"); x.set_defaults(f=cmd_login)
+    sp.add_parser("models").set_defaults(f=cmd_models)
+    sp.add_parser("status").set_defaults(f=cmd_status)
+    x = sp.add_parser("serve"); x.add_argument("model", choices=MODELS); x.add_argument("--idle", type=int, default=60, help="auto-stop after N idle minutes (0=never)")
+    x.add_argument("--ctx", type=int, default=32768); x.add_argument("--no-wait", action="store_true"); x.set_defaults(f=cmd_serve)
+    x = sp.add_parser("stop"); x.add_argument("model", nargs="?", choices=MODELS); x.add_argument("--all", action="store_true"); x.add_argument("--force", action="store_true"); x.set_defaults(f=cmd_stop)
+    x = sp.add_parser("logs"); x.add_argument("model", choices=MODELS); x.add_argument("-n", type=int, default=60); x.set_defaults(f=cmd_logs)
+    for name, fn in (("chat", cmd_chat), ("ask", cmd_ask)):
+        x = sp.add_parser(name); x.add_argument("--max-tokens", type=int, default=1024); x.add_argument("--temperature", type=float, default=0.2)
+        if name == "chat": x.add_argument("model", nargs="?")
+        else:
+            x.add_argument("prompt", nargs="*"); x.add_argument("-m", "--model"); x.add_argument("-i", "--image", action="append"); x.add_argument("--system")
+        x.set_defaults(f=fn)
+    x = sp.add_parser("env"); x.add_argument("model", nargs="?"); x.set_defaults(f=cmd_env)
+    x = sp.add_parser("_watch"); x.add_argument("model"); x.set_defaults(f=cmd_watch)
+    a = p.parse_args(); a.f(a)
+
+
+if __name__ == "__main__":
+    main()
